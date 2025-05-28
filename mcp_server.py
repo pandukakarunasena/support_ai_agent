@@ -1,13 +1,3 @@
-# fastmcp_http_server.py
-# ---------------------
-# An HTTP-based MCP server using fastmcp-http.
-# Exposes your tools via REST endpoints:
-#   GET  /tools                  → list tools
-#   POST /tools/<tool_name>      → invoke tool
-#
-# Install dependencies:
-#   pip install fastmcp-http aiohttp python-dotenv
-
 import os
 import json
 import aiohttp
@@ -26,16 +16,22 @@ from cachetools import TTLCache
 from dotenv import load_dotenv
 
 from fastmcp_http.server import FastMCPHttpServer
+from mcp_context import set_conversation_id, get_conversation_id
+
+# Logging setup
+LOG_FILE = "logs/mcp_server.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=5)
+    ]
+)
+logger = logging.getLogger("mcp_server")
 
 load_dotenv()
-
-PRODUCT_REPO_MAP = {
-  "wso2is":     "product-is",
-  "wso2is-km":  "product-is",
-  "wso2mi":     "product-micro-integrator",
-  "wso2ei":     "product-ei",
-  "wso2am":     "product-apim",
-}
 
 #chunking the JSON payload
 COLLECTION_NAME = "update_json_objects"
@@ -47,12 +43,6 @@ API_CACHE: TTLCache = TTLCache(maxsize=100, ttl=10 * 60)
 
 SEEN_HASHES = set()                                  
 VECTOR_INIT = False 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("mcp_server")
 
 def full_response_hash(payload: list) -> str:
     """Deterministic hash of the entire JSON array (order matters)."""
@@ -90,7 +80,7 @@ def upload_new_updates(json_list: list):
     # keep only unseen objects
     fresh = [o for o in json_list if object_hash(o) not in SEEN_HASHES]
     if not fresh:
-        logger.info("No new updates – Qdrant unchanged")
+        logger.info(f"[{get_conversation_id()}] o new updates – Qdrant unchanged")
         return
 
     texts   = [flatten_json(o) for o in fresh]
@@ -106,7 +96,7 @@ def upload_new_updates(json_list: list):
 
     # mark as seen
     SEEN_HASHES.update(object_hash(o) for o in fresh)
-    logger.info(f"Uploaded {len(fresh)} new updates to Qdrant")
+    logger.info(f"[{get_conversation_id()}] Uploaded {len(fresh)} new updates to Qdrant")
 
 def search_similar_json(query_text, top_k=5):
     query_vec = model.encode([query_text]).tolist()[0]
@@ -118,11 +108,11 @@ def search_similar_json(query_text, top_k=5):
         limit=top_k
     )
     
-    # logger.info for inspection (optional)
-    logger.info(f"\n Top {top_k} results for query: '{query_text}'")
+    # logger.info fo[{get_conversation_id()}] r inspection (optional)
+    logger.info(f"[{get_conversation_id()}] \n Top {top_k} results for query: '{query_text}'")
     for i, hit in enumerate(results, 1):
-        logger.info(f"\nResult #{i} (Score: {hit.score:.4f})")
-        logger.info(hit.payload)
+        logger.info(f"[{get_conversation_id()}] \nResult #{i} (Score: {hit.score:.4f})")
+        logger.info(f"[{get_conversation_id()}] {hit.payload}")
     
     # Return the top JSON payloads
     return [hit.payload for hit in results]
@@ -136,7 +126,7 @@ async def cached_api_fetch(product: str, version: str) -> list:
     cache_key = f"{product}:{version}"
     entry = API_CACHE.get(cache_key)
     if entry:
-        logger.info("Using cached API payload for %s %s", product, version)
+        logger.info(f"[{get_conversation_id()}] sing cached API payload for {product} {version}")
         return entry["data"]
 
     # 4. Fetch fresh data
@@ -146,12 +136,12 @@ async def cached_api_fetch(product: str, version: str) -> list:
     # 5. Compute new hash
     new_hash = full_response_hash(payload)
     if entry and entry.get("hash") == new_hash:
-        logger.info("Cached payload identical – skip refresh")
+        logger.info(f"[{get_conversation_id()}] ached payload identical – skip refresh")
         return entry["data"]
 
     # 6. Store in TTLCache
     API_CACHE[cache_key] = {"hash": new_hash, "data": payload}
-    logger.info("API cache refreshed for %s %s", product, version)
+    logger.info(f"[{get_conversation_id()}] PI cache refreshed for {product} {version}")
 
     return payload
 
@@ -186,7 +176,8 @@ async def _fetch_api(token: str, product: str, version:str) -> dict:
         "User-Agent": "PostmanRuntime/7.42.0"
     }
 
-    logger.info(">> Authorization header:", repr(headers))
+    logger.info(f"[{get_conversation_id()}] > Authorization header: {repr(headers)}")
+    
 
     url = os.getenv("API_BASE_URL", "").rstrip("/")
     if not url:
@@ -194,7 +185,7 @@ async def _fetch_api(token: str, product: str, version:str) -> dict:
     
     url = url.replace("product", product)
     url = url.replace("version", version)
-    logger.info(">> Request URL:", url)
+    logger.info(f"[{get_conversation_id()}] > Request URL: {url}")
 
     async with aiohttp.ClientSession() as session:
         resp = await session.get(url, headers=headers)
@@ -225,11 +216,15 @@ mcp = FastMCPHttpServer(
         "updates for that version."
     )
 )
-async def u2_update_summary(query:str, product: str, version:str) -> str:
+async def u2_update_summary(query:str, product: str, version:str, cid: str) -> str:
 
-    logger.info(f"Received query: {query}")
-    logger.info(f"Received product: {product}")
-    logger.info(f"Received product level: {version}")
+    # set id in thread local for correlation purposes
+    cid = cid or str(uuid.uuid4())
+    set_conversation_id(cid)
+
+    logger.info(f"[{get_conversation_id()}] Received query: {query}")
+    logger.info(f"[{get_conversation_id()}] Received product: {product}")
+    logger.info(f"[{get_conversation_id()}] Received product level: {version}")
     
     if not query:
         raise ValueError("Query cannot be empty")
@@ -245,12 +240,12 @@ async def u2_update_summary(query:str, product: str, version:str) -> str:
     upload_new_updates(json_data)
     matches = search_similar_json(query)
     
-    logger.info(f"Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
+    logger.info(f"[{get_conversation_id()}] Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
     return json.dumps(matches, separators=(",", ":"))
 
 
 def _build_url(term: str, repo: str | None, top_k: int) -> str:
-    logger.info(f"Building GitHub search URL from desc: {term}")
+    logger.info(f"[{get_conversation_id()}] Building GitHub search URL from desc: {term}")
     q  = f'"{term}" + in:title in:body in:comments is:issue'
     if repo:
         q += f" repo:wso2/{repo}"
@@ -270,15 +265,17 @@ def _build_url(term: str, repo: str | None, top_k: int) -> str:
         "most relevant matches."
     )
 )
-async def github_find_related_issues(repo: str, term: str, top_k: int = 5) -> str:
+async def github_find_related_issues(repo: str, term: str, cid: str, top_k: int = 5) -> str:
 
-    logger.info(f"Received repo: {repo}")
-    logger.info(f"[github_find_related_issues] searching `{term}`")
+    # set id in thread local for correlation purposes
+    cid = cid or str(uuid.uuid4())
+    set_conversation_id(cid)
 
-    git_repo = PRODUCT_REPO_MAP.get(repo, None)
-    logger.info(f"GitHub repo for {repo}: {git_repo}")
-    url = _build_url(term, git_repo, max(1, min(top_k, 10)))
-    logger.info(f"GitHub search URL: {url}")
+    logger.info(f"[{get_conversation_id()}] Received repo: {repo}")
+    logger.info(f"[{get_conversation_id()}] [github_find_related_issues] searching `{term}`")
+    
+    url = _build_url(term, repo, max(1, min(top_k, 10)))
+    logger.info(f"[{get_conversation_id()}] GitHub search URL: {url}")
     headers = {
         "Accept":      "application/vnd.github+json",
         "User-Agent":  "fastmcp-github-search/1.0"  # recommended by GitHub :contentReference[oaicite:1]{index=1}
@@ -286,14 +283,14 @@ async def github_find_related_issues(repo: str, term: str, top_k: int = 5) -> st
 
     async with aiohttp.ClientSession() as s:
         async with s.get(url, headers=headers) as r:
-            logger.info(f"GitHub search response: {r.status}")
+            logger.info(f"[{get_conversation_id()}] GitHub search response: {r.status}")
             if r.status == 403:
                 # GitHub responds 403 if the 60-per-hour unauth limit is exhausted
                 raise RuntimeError("GitHub unauthenticated rate-limit hit (60 req/hr). "
                                    "Try later or add a token.")
             r.raise_for_status()
             items = (await r.json())["items"]
-            logger.info(f"GitHub search returned {len(items)} items")
+            logger.info(f"[{get_conversation_id()}] GitHub search returned {len(items)} items")
 
     # Trim each issue to essentials so the LLM sees a small payload
     payload = [
@@ -313,10 +310,15 @@ async def github_find_related_issues(repo: str, term: str, top_k: int = 5) -> st
     name="dummy_tool",
     description="This is a dummy tool which can be used to get details of the birds"
 )
-async def dummy_tool(query:str, version:str) -> str:
+async def dummy_tool(query:str, version:str, cid:str) -> str:
 
-    logger.info(f"Received query: {query}")
-    logger.info(f"Received product level: {version}")
+    # set id in thread local for correlation purposes
+    cid = cid or str(uuid.uuid4())
+    set_conversation_id(cid)
+
+    logger.info(f"[{get_conversation_id()}] Received query: {query}")
+    logger.info(f"[{get_conversation_id()}] Received product level: {version}")
+
     return json.dumps("This is a dummy tool which can be used to get details of the birds", separators=(",", ":"))
 
 
@@ -341,7 +343,7 @@ if __name__ == "__main__":
 #             payload=obj  # Store entire JSON
 #         )
 #         client.upload_points(collection_name=COLLECTION_NAME, points=[point])
-#     logger.info(f"Uploaded {len(json_list)} JSON objects")
+#     logger.info(f"[{get_conversation_id()}] Uploaded {len(json_list)} JSON objects")
 
 
 # chunking is not needed as the similarity search is done on the entire JSON object
