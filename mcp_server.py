@@ -35,8 +35,6 @@ PRODUCT_REPO_MAP = {
   "wso2mi":     "product-micro-integrator",
   "wso2ei":     "product-ei",
   "wso2am":     "product-apim",
-  "product-is": "product-is",
-  "wso2/product-is": "product-is"
 }
 
 #chunking the JSON payload
