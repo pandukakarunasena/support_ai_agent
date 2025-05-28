@@ -29,13 +29,24 @@ from fastmcp_http.server import FastMCPHttpServer
 
 load_dotenv()
 
+PRODUCT_REPO_MAP = {
+  "wso2is":     "product-is",
+  "wso2is-km":  "product-is",
+  "wso2mi":     "product-micro-integrator",
+  "wso2ei":     "product-ei",
+  "wso2am":     "product-apim",
+  "product-is": "product-is",
+  "wso2/product-is": "product-is"
+}
 
 #chunking the JSON payload
 COLLECTION_NAME = "update_json_objects"
+_collection_inited = False
 model = SentenceTransformer("all-MiniLM-L6-v2")
-client = QdrantClient(":memory:")
+client = QdrantClient(path=":memory:")
 
-API_CACHE   = TTLCache(maxsize=2, ttl=10 * 60)        
+API_CACHE: TTLCache = TTLCache(maxsize=100, ttl=10 * 60)
+
 SEEN_HASHES = set()                                  
 VECTOR_INIT = False 
 
@@ -55,15 +66,24 @@ def object_hash(obj: dict) -> str:
     return sha256(key.encode()).hexdigest()
 
 # Prepare Qdrant collection (once)
-
 def ensure_vector_db(dimension: int):
-    global VECTOR_INIT
-    if not VECTOR_INIT:
-        client.recreate_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
-        )
-        VECTOR_INIT = True
+    global _collection_inited
+    if _collection_inited:
+        return
+
+    # If you want to start absolutely fresh each run, you can delete first:
+    try:
+        client.delete_collection(collection_name=COLLECTION_NAME)
+    except Exception:
+        pass
+
+    # Now create the collection
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+    )
+
+    _collection_inited = True
 
 def flatten_json(json_obj):
     return f"{json_obj.get('product-name', '')} {json_obj.get('product-version', '')} {json_obj.get('description', '')}"
@@ -72,7 +92,7 @@ def upload_new_updates(json_list: list):
     # keep only unseen objects
     fresh = [o for o in json_list if object_hash(o) not in SEEN_HASHES]
     if not fresh:
-        logging.info("No new updates – Qdrant unchanged")
+        logger.info("No new updates – Qdrant unchanged")
         return
 
     texts   = [flatten_json(o) for o in fresh]
@@ -88,7 +108,7 @@ def upload_new_updates(json_list: list):
 
     # mark as seen
     SEEN_HASHES.update(object_hash(o) for o in fresh)
-    logging.info(f"Uploaded {len(fresh)} new updates to Qdrant")
+    logger.info(f"Uploaded {len(fresh)} new updates to Qdrant")
 
 def search_similar_json(query_text, top_k=5):
     query_vec = model.encode([query_text]).tolist()[0]
@@ -100,33 +120,43 @@ def search_similar_json(query_text, top_k=5):
         limit=top_k
     )
     
-    # logging.info for inspection (optional)
-    logging.info(f"\n Top {top_k} results for query: '{query_text}'")
+    # logger.info for inspection (optional)
+    logger.info(f"\n Top {top_k} results for query: '{query_text}'")
     for i, hit in enumerate(results, 1):
-        logging.info(f"\nResult #{i} (Score: {hit.score:.4f})")
-        logging.info(hit.payload)
+        logger.info(f"\nResult #{i} (Score: {hit.score:.4f})")
+        logger.info(hit.payload)
     
     # Return the top JSON payloads
     return [hit.payload for hit in results]
 
-async def cached_api_fetch(product_version: str) -> list:
-    cache_key = f"{product_version}"
-    if cache_key in API_CACHE:
-        logging.info("Using cached API payload")
-        return API_CACHE[cache_key].get("data")
+async def cached_api_fetch(product: str, version: str) -> list:
 
-    token   = await _fetch_token()
-    payload = await _fetch_api(token, product_version)
+    #validate the product
+    # if product not in PRODUCT_REPO_MAP:
+    #     raise ValueError(f"Invalid product: {product}. Valid options are: {', '.join(PRODUCT_REPO_MAP.keys())}")
+    
+    cache_key = f"{product}:{version}"
+    entry = API_CACHE.get(cache_key)
+    if entry:
+        logger.info("Using cached API payload for %s %s", product, version)
+        return entry["data"]
 
-    # only replace cache if payload differs
+    # 4. Fetch fresh data
+    token = await _fetch_token()
+    payload = await _fetch_api(token, product, version)
+
+    # 5. Compute new hash
     new_hash = full_response_hash(payload)
-    if API_CACHE.get(cache_key, {}).get("hash") == new_hash:
-        logging.info("Cached payload identical – skip refresh")
-        return API_CACHE[cache_key]["data"]
+    if entry and entry.get("hash") == new_hash:
+        logger.info("Cached payload identical – skip refresh")
+        return entry["data"]
 
+    # 6. Store in TTLCache
     API_CACHE[cache_key] = {"hash": new_hash, "data": payload}
-    logging.info("API cache refreshed")
+    logger.info("API cache refreshed for %s %s", product, version)
+
     return payload
+
 
 async def _fetch_token() -> str:
     token_url = os.getenv("IDP_TOKEN_URL")
@@ -142,28 +172,31 @@ async def _fetch_token() -> str:
             resp.raise_for_status()
             return (await resp.json())["access_token"]
 
-async def _fetch_api(token: str, product_version:str) -> dict:
+async def _fetch_api(token: str, product: str, version:str) -> dict:
 
     if not token:
         raise RuntimeError("Empty token passed to _fetch_api()")
-    if not product_version:
+    if not product:
+        raise RuntimeError("Empty product passed to _fetch_api()")
+    if not version:
         raise RuntimeError("Empty product level passed to _fetch_api()")
+    
     token = token.strip().strip('"').strip("'")
-
     headers = {
         "Authorization": f"Bearer {token}".strip(),
         "Accept": "*/*",
         "User-Agent": "PostmanRuntime/7.42.0"
     }
 
-    logging.info(">> Authorization header:", repr(headers))
+    logger.info(">> Authorization header:", repr(headers))
 
     url = os.getenv("API_BASE_URL", "").rstrip("/")
     if not url:
         raise RuntimeError("API_BASE_URL not set in environment")
     
-    url = url.replace("product_version", product_version)
-    logging.info(">> Request URL:", url)
+    url = url.replace("product", product)
+    url = url.replace("version", version)
+    logger.info(">> Request URL:", url)
 
     async with aiohttp.ClientSession() as session:
         resp = await session.get(url, headers=headers)
@@ -181,7 +214,7 @@ mcp = FastMCPHttpServer(
         "Exposes two troubleshooting tools over MCP/HTTP:\n"
         "  • u2_update_summary — fetch the official JSON summary of bug fixes, "
         "improvements, and security updates for a specific product version from our protected API;\n"
-        "  • github_find_related_issues — search the WSO2 product-is GitHub repo for "
+        "  • github_find_related_issues — search the WSO2 organization GitHub repos for "
         "issues matching a single technical keyword."
     )
 )
@@ -194,30 +227,35 @@ mcp = FastMCPHttpServer(
         "updates for that version."
     )
 )
-async def u2_update_summary(query:str, product_version:str) -> str:
+async def u2_update_summary(query:str, product: str, version:str) -> str:
 
-    logging.info(f"Received query: {query}")
-    logging.info(f"Received product level: {product_version}")
+    logger.info(f"Received query: {query}")
+    logger.info(f"Received product: {product}")
+    logger.info(f"Received product level: {version}")
+    
     if not query:
         raise ValueError("Query cannot be empty")
     
-    if not product_version or not re.compile(r'^\d+\.\d+\.\d+$').fullmatch(product_version):   
-        # raise ValueError("Product level value is not valid. It should be in the format x.x.x")
-        product_version = "5.11.0"
+    if not product:   
+        raise ValueError("Product level value is not valid. It should be in the format x.x.x")
     
-    json_data = await cached_api_fetch(product_version)
+    if not version or not re.compile(r'^\d+\.\d+\.\d+$').fullmatch(version):   
+        raise ValueError("Product level value is not valid. It should be in the format x.x.x")
+        
+    
+    json_data = await cached_api_fetch(product, version)
     upload_new_updates(json_data)
     matches = search_similar_json(query)
     
-    logging.info(f"Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
+    logger.info(f"Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
     return json.dumps(matches, separators=(",", ":"))
 
 
 def _build_url(term: str, repo: str | None, top_k: int) -> str:
-    logging.info(f"Building GitHub search URL from desc: {term}")
-    q  = f'"{term}" in:title,body,comments is:issue'
+    logger.info(f"Building GitHub search URL from desc: {term}")
+    q  = f'"{term}" + in:title in:body in:comments is:issue'
     if repo:
-        q += f" repo:{repo}"
+        q += f" repo:wso2/{repo}"
     params = {
         "q":        q,
         "sort":     "updated",
@@ -230,15 +268,19 @@ def _build_url(term: str, repo: str | None, top_k: int) -> str:
     name="github_find_related_issues",
     description=(
         "Given one single-word technical term (e.g. “OAuth”, “NullPointerException”), "
-        "search the WSO2 product-is GitHub repository’s issues and return the top_k "
+        "search the WSO2 organization GitHub repositories issues and return the top_k "
         "most relevant matches."
     )
 )
-async def github_find_related_issues(term: str, top_k: int = 5) -> str:
-    repo = "wso2/product-is"
-    logging.info(f"[github_find_related_issues] searching `{term}`")
-    url = _build_url(term, repo, max(1, min(top_k, 10)))
-    logging.info(f"GitHub search URL: {url}")
+async def github_find_related_issues(repo: str, term: str, top_k: int = 5) -> str:
+
+    logger.info(f"Received repo: {repo}")
+    logger.info(f"[github_find_related_issues] searching `{term}`")
+
+    git_repo = PRODUCT_REPO_MAP.get(repo, None)
+    logger.info(f"GitHub repo for {repo}: {git_repo}")
+    url = _build_url(term, git_repo, max(1, min(top_k, 10)))
+    logger.info(f"GitHub search URL: {url}")
     headers = {
         "Accept":      "application/vnd.github+json",
         "User-Agent":  "fastmcp-github-search/1.0"  # recommended by GitHub :contentReference[oaicite:1]{index=1}
@@ -246,14 +288,14 @@ async def github_find_related_issues(term: str, top_k: int = 5) -> str:
 
     async with aiohttp.ClientSession() as s:
         async with s.get(url, headers=headers) as r:
-            logging.info(f"GitHub search response: {r.status}")
+            logger.info(f"GitHub search response: {r.status}")
             if r.status == 403:
                 # GitHub responds 403 if the 60-per-hour unauth limit is exhausted
                 raise RuntimeError("GitHub unauthenticated rate-limit hit (60 req/hr). "
                                    "Try later or add a token.")
             r.raise_for_status()
             items = (await r.json())["items"]
-            logging.info(f"GitHub search returned {len(items)} items")
+            logger.info(f"GitHub search returned {len(items)} items")
 
     # Trim each issue to essentials so the LLM sees a small payload
     payload = [
@@ -273,16 +315,16 @@ async def github_find_related_issues(term: str, top_k: int = 5) -> str:
     name="dummy_tool",
     description="This is a dummy tool which can be used to get details of the birds"
 )
-async def u2_update_summary(query:str, product_version:str) -> str:
+async def dummy_tool(query:str, version:str) -> str:
 
-    logging.info(f"Received query: {query}")
-    logging.info(f"Received product level: {product_version}")
+    logger.info(f"Received query: {query}")
+    logger.info(f"Received product level: {version}")
     return json.dumps("This is a dummy tool which can be used to get details of the birds", separators=(",", ":"))
 
 
 # --- Run the HTTP server ------------------------------------------
 if __name__ == "__main__":
-    logging.info("Starting MCP HTTP server...")
+    logger.info("Starting MCP HTTP server...")
     port = int(os.getenv("MCP_PORT", 9999))
     host = os.getenv("MCP_HOST", "0.0.0.0") 
     mcp.run_http(host=host, port=port, register_server=False)
@@ -301,7 +343,7 @@ if __name__ == "__main__":
 #             payload=obj  # Store entire JSON
 #         )
 #         client.upload_points(collection_name=COLLECTION_NAME, points=[point])
-#     logging.info(f"Uploaded {len(json_list)} JSON objects")
+#     logger.info(f"Uploaded {len(json_list)} JSON objects")
 
 
 # chunking is not needed as the similarity search is done on the entire JSON object
