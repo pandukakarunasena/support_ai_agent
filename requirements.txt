@@ -1,7 +1,6 @@
 aiohttp==3.11.18
 tiktoken==0.9.0
 requests==2.32.3
-sentence-transformers[torch-cpu]==4.1.0
 qdrant-client==1.14.2
 cachetools==5.5.2
 python-dotenv==1.1.0
