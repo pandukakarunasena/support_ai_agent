@@ -55,10 +55,10 @@ COLLECTION_NAME = "update_json_objects"
 # instantiate VectorDB (will create & manage the Qdrant collection for you)
 vector_db = VectorDB(collection_name=COLLECTION_NAME)
 
-API_CACHE: TTLCache = TTLCache(maxsize=100, ttl=10 * 60)
+API_CACHE: TTLCache = TTLCache(maxsize=100, ttl=20 * 60)
 
 SEEN_HASHES = set()                                  
-VECTOR_INIT = False 
+# VECTOR_INIT = False 
 
 # def encode(texts):
 #     inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="np")
@@ -122,14 +122,20 @@ def upload_new_updates(json_list: list):
     #     # use a random 64-bit id
     #     point_id = uuid.uuid4().int >> 64
     #     vector_db.add_text(id=point_id, text=text, metadata=o)
+
+    # add product name as a key for filtering lateron
+    metadatas = [
+        {**obj, "product": obj["product-name"]}
+        for obj in fresh
+    ]
     texts = [flatten_json(o) for o in fresh]
-    vector_db.add_texts(texts=texts, metadatas=fresh)   # <-- refactored call
+    vector_db.add_texts(texts=texts, metadatas=metadatas)   # <-- refactored call
 
     # mark as seen
     SEEN_HASHES.update(object_hash(o) for o in fresh)
     logger.info(f"[{get_conversation_id()}] Uploaded {len(fresh)} new updates to Qdrant")
 
-def search_similar_json(query_text, top_k=5):
+def search_similar_json(query_text, product, top_k=5):
     # query_text = vector_db.get_embedding(query_text)
     
     # Perform vector search
@@ -139,7 +145,7 @@ def search_similar_json(query_text, top_k=5):
     #     limit=top_k
     # )
     
-    results = vector_db.similarity_search(query_text, limit=top_k)
+    results = vector_db.similarity_search(query_text, product, limit=top_k)
 
     # logger.info fo[{get_conversation_id()}] r inspection (optional)
     logger.info(f"[{get_conversation_id()}] \n Top {top_k} results for query: '{query_text}'")
@@ -270,7 +276,7 @@ async def u2_update_summary(query:str, product: str, version:str, cid: str) -> s
     
     json_data = await cached_api_fetch(product, version)
     upload_new_updates(json_data)
-    matches = search_similar_json(query)
+    matches = search_similar_json(query, product)
     
     logger.info(f"[{get_conversation_id()}] Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
     return json.dumps(matches, separators=(",", ":"))
