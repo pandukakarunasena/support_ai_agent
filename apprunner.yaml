@@ -1,0 +1,17 @@
+version: 1.0
+runtime: python3.11 # Or your desired Python version
+build:
+  commands:
+    build:
+      # Step 1: Install uv (if you want to use it)
+      - pip install uv
+      # Step 2: Use uv to install dependencies from requirements.txt
+      - uv pip install -r requirements.txt
+      # Or, if you are using uv for project management with pyproject.toml:
+      # - uv sync
+      # Add other build steps here if needed
+      # - python manage.py collectstatic --noinput # Example for Django
+run:
+  command: uv run mcp_server.py
+  network:
+    port: 8080 # Or your application's port
