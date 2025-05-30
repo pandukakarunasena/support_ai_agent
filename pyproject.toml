@@ -5,5 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "onnxruntime>=1.22.0",
+    "openai>=1.82.1",
     "pipreqs>=0.5.0",
 ]

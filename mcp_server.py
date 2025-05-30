@@ -7,7 +7,15 @@ import requests
 import re
 import urllib.parse
 import logging
-from sentence_transformers import SentenceTransformer
+import openai
+from vectordb import VectorDB    
+
+# import onnxruntime
+# from transformers import AutoTokenizer
+# import numpy as np
+
+# from sentence_transformers import SentenceTransformer
+# from sentence_transformers.util import export_to_onnx
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from hashlib import sha256
@@ -32,17 +40,31 @@ logging.basicConfig(
 logger = logging.getLogger("mcp_server")
 
 load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 #chunking the JSON payload
 COLLECTION_NAME = "update_json_objects"
 _collection_inited = False
-model = SentenceTransformer("all-MiniLM-L6-v2")
-client = QdrantClient(path=":memory:")
+# model = SentenceTransformer("all-MiniLM-L6-v2")
+# tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+# session = onnxruntime.InferenceSession('model.onnx')
+# client = QdrantClient(path=":memory:")
+
+COLLECTION_NAME = "update_json_objects"
+
+# instantiate VectorDB (will create & manage the Qdrant collection for you)
+vector_db = VectorDB(collection_name=COLLECTION_NAME)
 
 API_CACHE: TTLCache = TTLCache(maxsize=100, ttl=10 * 60)
 
 SEEN_HASHES = set()                                  
 VECTOR_INIT = False 
+
+# def encode(texts):
+#     inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="np")
+#     ort_inputs = {k: v for k, v in inputs.items()}
+#     embeddings = session.run(None, ort_inputs)[0]
+#     return embeddings
 
 def full_response_hash(payload: list) -> str:
     """Deterministic hash of the entire JSON array (order matters)."""
@@ -54,66 +76,74 @@ def object_hash(obj: dict) -> str:
     return sha256(key.encode()).hexdigest()
 
 # Prepare Qdrant collection (once)
-def ensure_vector_db(dimension: int):
-    global _collection_inited
-    if _collection_inited:
-        return
+# def ensure_vector_db(dimension: int):
+#     global _collection_inited
+#     if _collection_inited:
+#         return
 
-    # If you want to start absolutely fresh each run, you can delete first:
-    try:
-        client.delete_collection(collection_name=COLLECTION_NAME)
-    except Exception:
-        pass
+#     # If you want to start absolutely fresh each run, you can delete first:
+#     try:
+#         client.delete_collection(collection_name=COLLECTION_NAME)
+#     except Exception:
+#         pass
 
-    # Now create the collection
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
-    )
+#     # Now create the collection
+#     client.create_collection(
+#         collection_name=COLLECTION_NAME,
+#         vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+#     )
 
-    _collection_inited = True
+    # _collection_inited = True
 
 def flatten_json(json_obj):
     return f"{json_obj.get('product-name', '')} {json_obj.get('product-version', '')} {json_obj.get('description', '')}"
 
 def upload_new_updates(json_list: list):
-    # keep only unseen objects
+   
     fresh = [o for o in json_list if object_hash(o) not in SEEN_HASHES]
     if not fresh:
         logger.info(f"[{get_conversation_id()}] o new updates – Qdrant unchanged")
         return
 
-    texts   = [flatten_json(o) for o in fresh]
-    vectors = model.encode(texts).tolist()
+    # texts   = [flatten_json(o) for o in fresh]
+    # vectors = encode(texts).tolist()
 
-    ensure_vector_db(len(vectors[0]))
+    # ensure_vector_db(len(vectors[0]))
 
-    points = [
-        PointStruct(id=uuid.uuid4().int >> 64, vector=v, payload=o)
-        for v, o in zip(vectors, fresh)
-    ]
-    client.upload_points(collection_name=COLLECTION_NAME, points=points)
+    # points = [
+    #     PointStruct(id=uuid.uuid4().int >> 64, vector=v, payload=o)
+    #     for v, o in zip(vectors, fresh)
+    # ]
+    # client.upload_points(collection_name=COLLECTION_NAME, points=points)
+
+    # for each new object, flatten & add to VectorDB
+    for o in fresh:
+        text = flatten_json(o)
+        # use a random 64-bit id
+        point_id = uuid.uuid4().int >> 64
+        vector_db.add_text(id=point_id, text=text, metadata=o)
 
     # mark as seen
     SEEN_HASHES.update(object_hash(o) for o in fresh)
     logger.info(f"[{get_conversation_id()}] Uploaded {len(fresh)} new updates to Qdrant")
 
 def search_similar_json(query_text, top_k=5):
-    query_vec = model.encode([query_text]).tolist()[0]
+    query_vec = vector_db.get_embedding([query_text]).tolist()[0]
     
     # Perform vector search
-    results = client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vec,
-        limit=top_k
-    )
+    # results = client.search(
+    #     collection_name=COLLECTION_NAME,
+    #     query_vector=query_vec,
+    #     limit=top_k
+    # )
     
+    results = vector_db.similarity_search(query_text, limit=top_k)
+
     # logger.info fo[{get_conversation_id()}] r inspection (optional)
     logger.info(f"[{get_conversation_id()}] \n Top {top_k} results for query: '{query_text}'")
     for i, hit in enumerate(results, 1):
         logger.info(f"[{get_conversation_id()}] \nResult #{i} (Score: {hit.score:.4f})")
         logger.info(f"[{get_conversation_id()}] {hit.payload}")
-    
     # Return the top JSON payloads
     return [hit.payload for hit in results]
 
@@ -332,7 +362,7 @@ if __name__ == "__main__":
 
 # def upload_json_objects(json_list):
 #     texts = [flatten_json(obj) for obj in json_list]
-#     vectors = model.encode(texts).tolist()
+#     vectors = encode(texts).tolist()
 
 #     initialize_vector_db(len(vectors[0]))
 
