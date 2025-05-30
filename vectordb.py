@@ -1,15 +1,30 @@
 import os
 import tiktoken
+import logging
+import logging.handlers        # ← add this line
 import uuid
 from openai import OpenAI
 from typing import List, Sequence
 from qdrant_client import QdrantClient, models
+from mcp_context import set_conversation_id, get_conversation_id
+
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 _MAX_ITEMS   = 96
 _MAX_TOKENS  = 8192 - 256      # 256-token safety cushion
 _enc         = tiktoken.get_encoding("cl100k_base")   # ada-002 encoder
-# Set OpenAI API key from environment variable
+
+LOG_FILE = "logs/mcp_server.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=5)
+    ]
+)
+logger = logging.getLogger("vector_db")
 
 class VectorDB:
     def __init__(self, collection_name: str, qdrant_url=":memory:"):
@@ -26,6 +41,8 @@ class VectorDB:
         )
 
     def get_embedding(self, text: str):
+        logger.debug(f"[{get_conversation_id()}] Embedding single text "
+                     f"(≈{len(text)} chars)")
         response = client.embeddings.create(input=text, model=self.embedding_model)
         return response.data[0].embedding
     
@@ -33,6 +50,7 @@ class VectorDB:
         return len(_enc.encode(text))
 
     def get_embeddings(self, texts: Sequence[str]) -> List[List[float]]:
+        logger.info(f"[{get_conversation_id()}] Embedding batch of {len(texts)} texts")
         all_vecs: list[list[float]] = []
         start = 0
         while start < len(texts):
@@ -46,14 +64,20 @@ class VectorDB:
                 end += 1
 
             batch = texts[start:end]
+            logger.debug(f"[{get_conversation_id()}]  » Sub-batch {start}:{end} "
+                         f"({len(batch)} items, {tok_sum} tokens)")
             resp  = client.embeddings.create(input=batch, model=self.embedding_model)
             vecs  = [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
             all_vecs.extend(vecs)
 
             start = end
+            logger.info(f"[{get_conversation_id()}] Embedded {len(texts)} texts "
+                    f"into {len(all_vecs)} vectors")
         return all_vecs
 
     def add_text(self, id: int, text: str, metadata: dict = None):
+        logger.info(f"[{get_conversation_id()}] Upserting point id={id} "
+                    f"into '{self.collection_name}'")
         embedding = self.get_embedding(text)
         self.client.upsert(
             collection_name=self.collection_name,
@@ -66,9 +90,10 @@ class VectorDB:
         
             metadatas = metadatas or [{}] * len(texts)
             ids = [uuid.uuid4().int >> 64 for _ in texts]
-
+            logger.info(f"[{get_conversation_id()}] add_texts: {len(texts)} items → "
+                f"collection '{self.collection_name}'")
             embeddings = self.get_embeddings(texts)          # existing batch helper
-
+            
             points = [
                 models.PointStruct(
                     id=pid,
@@ -78,15 +103,33 @@ class VectorDB:
                 for pid, vec, txt, meta in zip(ids, embeddings, texts, metadatas)
             ]
             self.client.upsert(self.collection_name, points=points)
+            logger.info(f"[{get_conversation_id()}] Upserted {len(points)} points")
+
             #return ids
     
-    def similarity_search(self, query_text: str, limit: int = 6):
+    def similarity_search(self, query_text: str, product: str, limit: int = 6):
         query_embedding = self.get_embedding(query_text)
+        # results = self.client.search(
+        #     collection_name=self.collection_name,
+        #     query_vector= query_embedding,
+        #     limit=limit,
+        # )
+        logger.info(f"[{get_conversation_id()}] similarity_search "
+                    f"('{query_text[:40]}…', product={product})")
+
         results = self.client.search(
             collection_name=self.collection_name,
-            query_vector= query_embedding,
+            query_vector=query_embedding,
             limit=limit,
+            query_filter=models.Filter(
+                must=[models.FieldCondition(key="product",
+                                            match=models.MatchValue(value=product))],
+            ),
+            with_payload=True
         )
+
+        logger.info(f"[{get_conversation_id()}] Search returned {len(results)} hits")
+
         return [
             {"id": result.id, "score": result.score, "text": result.payload["text"], "metadata": result.payload}
             for result in results
