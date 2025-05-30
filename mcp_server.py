@@ -150,10 +150,10 @@ def search_similar_json(query_text, product, top_k=5):
     # logger.info fo[{get_conversation_id()}] r inspection (optional)
     logger.info(f"[{get_conversation_id()}] \n Top {top_k} results for query: '{query_text}'")
     for i, hit in enumerate(results, 1):
-        logger.info(f"[{get_conversation_id()}] \nResult #{i} (Score: {hit["score"]:.4f})")
-        logger.info(f"[{get_conversation_id()}] {hit["metadata"]}")
+        logger.info(f"[{get_conversation_id()}] \nResult #{i} (Score: {hit['score']:.4f})")
+        logger.info(f"[{get_conversation_id()}] {hit['metadata']}")
     # Return the top JSON payloads
-    return [hit["metadata"] for hit in results]
+    return [hit['metadata'] for hit in results]
 
 async def cached_api_fetch(product: str, version: str) -> list:
 
