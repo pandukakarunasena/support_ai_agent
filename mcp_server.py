@@ -16,8 +16,8 @@ from vectordb import VectorDB
 
 # from sentence_transformers import SentenceTransformer
 # from sentence_transformers.util import export_to_onnx
-from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance, PointStruct
+# from qdrant_client import QdrantClient
+# from qdrant_client.models import VectorParams, Distance, PointStruct
 from hashlib import sha256
 from cachetools import TTLCache
 
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger("mcp_server")
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# openai.api_key = os.getenv("OPENAI_API_KEY")
 
 #chunking the JSON payload
 COLLECTION_NAME = "update_json_objects"
@@ -117,18 +117,20 @@ def upload_new_updates(json_list: list):
     # client.upload_points(collection_name=COLLECTION_NAME, points=points)
 
     # for each new object, flatten & add to VectorDB
-    for o in fresh:
-        text = flatten_json(o)
-        # use a random 64-bit id
-        point_id = uuid.uuid4().int >> 64
-        vector_db.add_text(id=point_id, text=text, metadata=o)
+    # for o in fresh:
+    #     text = flatten_json(o)
+    #     # use a random 64-bit id
+    #     point_id = uuid.uuid4().int >> 64
+    #     vector_db.add_text(id=point_id, text=text, metadata=o)
+    texts = [flatten_json(o) for o in fresh]
+    vector_db.add_texts(texts=texts, metadatas=fresh)   # <-- refactored call
 
     # mark as seen
     SEEN_HASHES.update(object_hash(o) for o in fresh)
     logger.info(f"[{get_conversation_id()}] Uploaded {len(fresh)} new updates to Qdrant")
 
 def search_similar_json(query_text, top_k=5):
-    query_vec = vector_db.get_embedding([query_text]).tolist()[0]
+    # query_text = vector_db.get_embedding(query_text)
     
     # Perform vector search
     # results = client.search(
@@ -142,10 +144,10 @@ def search_similar_json(query_text, top_k=5):
     # logger.info fo[{get_conversation_id()}] r inspection (optional)
     logger.info(f"[{get_conversation_id()}] \n Top {top_k} results for query: '{query_text}'")
     for i, hit in enumerate(results, 1):
-        logger.info(f"[{get_conversation_id()}] \nResult #{i} (Score: {hit.score:.4f})")
-        logger.info(f"[{get_conversation_id()}] {hit.payload}")
+        logger.info(f"[{get_conversation_id()}] \nResult #{i} (Score: {hit["score"]:.4f})")
+        logger.info(f"[{get_conversation_id()}] {hit["metadata"]}")
     # Return the top JSON payloads
-    return [hit.payload for hit in results]
+    return [hit["metadata"] for hit in results]
 
 async def cached_api_fetch(product: str, version: str) -> list:
 
