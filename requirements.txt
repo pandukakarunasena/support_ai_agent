@@ -5,3 +5,4 @@ qdrant-client==1.14.2
 cachetools==5.5.2
 python-dotenv==1.1.0
 fastmcp-http==0.1.4
+openai>=1.82.1
