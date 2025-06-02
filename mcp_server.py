@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from fastmcp_http.server import FastMCPHttpServer
 from mcp_context import set_conversation_id, get_conversation_id
+from errors.MCPToolError import MCPToolError
 
 # Logging setup
 LOG_FILE = "logs/mcp_server.log"
@@ -155,7 +156,7 @@ def search_similar_json(query_text, product, top_k=5):
     # Return the top JSON payloads
     return [hit['metadata'] for hit in results]
 
-async def cached_api_fetch(product: str, version: str) -> list:
+async def cached_api_fetch(product: str, version: str, access_token: str) -> list:
 
     #validate the product
     # if product not in PRODUCT_REPO_MAP:
@@ -168,8 +169,8 @@ async def cached_api_fetch(product: str, version: str) -> list:
         return entry["data"]
 
     # 4. Fetch fresh data
-    token = await _fetch_token()
-    payload = await _fetch_api(token, product, version)
+    # token = await _fetch_token()
+    payload = await _fetch_api(access_token, product, version)
 
     # 5. Compute new hash
     new_hash = full_response_hash(payload)
@@ -254,7 +255,7 @@ mcp = FastMCPHttpServer(
         "updates for that version."
     )
 )
-async def u2_update_summary(query:str, product: str, version:str, cid: str) -> str:
+async def u2_update_summary(query:str, product: str, version:str, cid: str, access_token: str) -> str:
 
     # set id in thread local for correlation purposes
     cid = cid or str(uuid.uuid4())
@@ -263,23 +264,41 @@ async def u2_update_summary(query:str, product: str, version:str, cid: str) -> s
     logger.info(f"[{get_conversation_id()}] Received query: {query}")
     logger.info(f"[{get_conversation_id()}] Received product: {product}")
     logger.info(f"[{get_conversation_id()}] Received product level: {version}")
+    logger.info(f"[{get_conversation_id()}] Received access token: {access_token[:20]}")
     
-    if not query:
-        raise ValueError("Query cannot be empty")
-    
-    if not product:   
-        raise ValueError("Product level value is not valid. It should be in the format x.x.x")
-    
-    if not version or not re.compile(r'^\d+\.\d+\.\d+$').fullmatch(version):   
-        raise ValueError("Product level value is not valid. It should be in the format x.x.x")
+    try:
+        if not query:
+            raise ValueError("Query cannot be empty")
         
+        if not product:   
+            raise ValueError("Product level value is not valid. It should be in the format x.x.x")
+        
+        if not version or not re.compile(r'^\d+\.\d+\.\d+$').fullmatch(version):   
+            raise ValueError("Product level value is not valid. It should be in the format x.x.x")
+        
+        if not access_token:
+            raise ValueError("Access token cannot be empty")
+            
+        json_data = await cached_api_fetch(product, version, access_token)
+        upload_new_updates(json_data)
+        matches = search_similar_json(query, product)
+        
+        logger.info(f"[{get_conversation_id()}] Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
+        return json.dumps(matches, separators=(",", ":"))
     
-    json_data = await cached_api_fetch(product, version)
-    upload_new_updates(json_data)
-    matches = search_similar_json(query, product)
-    
-    logger.info(f"[{get_conversation_id()}] Token size of the payload from server {len(tiktoken.get_encoding('cl100k_base').encode(json.dumps(matches)))}")
-    return json.dumps(matches, separators=(",", ":"))
+    except ValueError as ve:
+
+        msg = str(ve)
+        logger.warning(f"[{cid}] Validation error in u2_update_summary: {msg}")
+        return MCPToolError(code="INVALID_ARGUMENT", message=msg).to_tool_response()
+
+    except Exception as exc:
+
+        logger.exception(f"[{cid}] Unexpected error in u2_update_summary")
+        return MCPToolError(
+            code="INTERNAL_ERROR",
+            message="An unexpected error occurred while fetching update summary. Please try again later."
+        ).to_tool_response()
 
 
 def _build_url(term: str, repo: str | None, top_k: int) -> str:
