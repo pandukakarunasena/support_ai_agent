@@ -156,7 +156,7 @@ def search_similar_json(query_text, product, top_k=5):
     # Return the top JSON payloads
     return [hit['metadata'] for hit in results]
 
-async def cached_api_fetch(product: str, version: str, access_token: str) -> list:
+async def cached_api_fetch(product: str, version: str, access_token: str, startulevel: str, endulevel: str) -> list:
 
     #validate the product
     # if product not in PRODUCT_REPO_MAP:
@@ -170,7 +170,7 @@ async def cached_api_fetch(product: str, version: str, access_token: str) -> lis
 
     # 4. Fetch fresh data
     # token = await _fetch_token()
-    payload = await _fetch_api(access_token, product, version)
+    payload = await _fetch_api(access_token, product, version, startulevel, endulevel)
 
     # 5. Compute new hash
     new_hash = full_response_hash(payload)
@@ -199,7 +199,7 @@ async def _fetch_token() -> str:
             resp.raise_for_status()
             return (await resp.json())["access_token"]
 
-async def _fetch_api(token: str, product: str, version:str) -> dict:
+async def _fetch_api(token: str, product: str, version:str, startulevel: str, endulevel:str) -> dict:
 
     if not token:
         raise RuntimeError("Empty token passed to _fetch_api()")
@@ -224,6 +224,8 @@ async def _fetch_api(token: str, product: str, version:str) -> dict:
     
     url = url.replace("product", product)
     url = url.replace("version", version)
+    url = url.replace("startulevel", startulevel)
+    url = url.replace("endulevel", endulevel)
     logger.info(f"[{get_conversation_id()}] > Request URL: {url}")
 
     async with aiohttp.ClientSession() as session:
@@ -250,12 +252,12 @@ mcp = FastMCPHttpServer(
 @mcp.tool(
     name="u2_update_summary",
     description=(
-        "Given a product version (e.g. “5.11.0”), retrieve from the protected API the "
+        "Given a product, product version (e.g. “5.11.0”), starting update level ( startulevel ) and end update level ( endulevel )retrieve from the protected API the "
         "latest JSON payload listing bug fixes, feature improvements, and security "
         "updates for that version."
     )
 )
-async def u2_update_summary(query:str, product: str, version:str, cid: str, access_token: str) -> str:
+async def u2_update_summary(query:str, product: str, version:str, cid: str, access_token: str, startulevel: str, endulevel:str) -> str:
 
     # set id in thread local for correlation purposes
     cid = cid or str(uuid.uuid4())
@@ -265,6 +267,8 @@ async def u2_update_summary(query:str, product: str, version:str, cid: str, acce
     logger.info(f"[{get_conversation_id()}] Received product: {product}")
     logger.info(f"[{get_conversation_id()}] Received product level: {version}")
     logger.info(f"[{get_conversation_id()}] Received access token: {access_token[:20]}")
+    logger.info(f"[{get_conversation_id()}] Received startulevel: {startulevel}")
+    logger.info(f"[{get_conversation_id()}] Received endulevel: {endulevel}")
     
     try:
         if not query:
@@ -278,8 +282,14 @@ async def u2_update_summary(query:str, product: str, version:str, cid: str, acce
         
         if not access_token:
             raise ValueError("Access token cannot be empty")
+        
+        if not startulevel:
+            raise ValueError("Start update level value is not valid. It should be in the format x.x")
+        
+        if not endulevel:
+            raise ValueError("End update level value is not valid. It should be in the format x.x")
             
-        json_data = await cached_api_fetch(product, version, access_token)
+        json_data = await cached_api_fetch(product, version, access_token, startulevel, endulevel)
         upload_new_updates(json_data)
         matches = search_similar_json(query, product)
         
@@ -298,7 +308,7 @@ async def u2_update_summary(query:str, product: str, version:str, cid: str, acce
         return MCPToolError(
             code="INTERNAL_ERROR",
             message="An unexpected error occurred while fetching update summary. Please try again later."
-        ).to_tool_response()
+        ).to_tool_response(0)
 
 
 def _build_url(term: str, repo: str | None, top_k: int) -> str:
